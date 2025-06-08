@@ -20,12 +20,11 @@ namespace async {
             Stream* stream;
             bool isPlaying;
             bool isPaused;
-            uint32_t dataSize;  // 0 = infinite stream
-            uint32_t position;
             float volume;
+            float fadeVolume;
             int16_t* buffer;
             size_t bufferPos;
-            bool parseWavHeader;
+            bool loop;
         };
 
         static const int MAX_TRACKS = 4;
@@ -50,12 +49,11 @@ namespace async {
                     .stream = nullptr,
                     .isPlaying = false,
                     .isPaused = false,
-                    .dataSize = 0,
-                    .position = 0,
                     .volume = 1.0f,
+                    .fadeVolume = 0.0f,
                     .buffer = nullptr,
                     .bufferPos = 0,
-                    .parseWavHeader = false
+                    .loop = false
                 };
             }
             
@@ -79,9 +77,9 @@ namespace async {
                 .communication_format = I2S_COMM_FORMAT_STAND_I2S,
                 .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
                 .dma_buf_count = 8,
-                .dma_buf_len = 512,
+                .dma_buf_len = 1024,
                 .use_apll = false,
-                .tx_desc_auto_clear = true
+                .tx_desc_auto_clear = true,
             };
             
             i2s_pin_config_t pin_config = {
@@ -127,29 +125,42 @@ namespace async {
             return true;
         }
         
-        bool play(int trackNum, Stream* stream, bool parseWavHeader = false, uint32_t dataSize = 0) {
+        bool play(int trackNum, Stream* stream) {
             if (trackNum < 0 || trackNum >= MAX_TRACKS || !initialized || !stream) return false;
             
             //stop(trackNum);
-            
-            uint32_t headerSize = 0;
-            if (parseWavHeader) {
-                if (!skipWavHeader(stream)) {
-                    return false;
-                }
-                headerSize = 44; // Standard WAV header size for 16-bit mono
-            }
+            stream->seek(44);
             
             tracks[trackNum] = {
                 .stream = stream,
                 .isPlaying = true,
                 .isPaused = false,
-                .dataSize = dataSize > headerSize ? dataSize - headerSize : 0,
-                .position = 0,
                 .volume = tracks[trackNum].volume,
+                .fadeVolume = 0,
                 .buffer = tracks[trackNum].buffer,
                 .bufferPos = mixBufferSize, // Force buffer refill
-                .parseWavHeader = parseWavHeader
+                .loop = false
+            };
+            
+            if (eventCallback) eventCallback(trackNum, TRACK_STARTED);
+            return true;
+        }
+
+        bool loop(int trackNum, Stream* stream) {
+            if (trackNum < 0 || trackNum >= MAX_TRACKS || !initialized || !stream) return false;
+            
+            //stop(trackNum);
+            stream->seek(44);
+            
+            tracks[trackNum] = {
+                .stream = stream,
+                .isPlaying = true,
+                .isPaused = false,
+                .volume = tracks[trackNum].volume,
+                .fadeVolume = 0,
+                .buffer = tracks[trackNum].buffer,
+                .bufferPos = mixBufferSize, // Force buffer refill
+                .loop = true
             };
             
             if (eventCallback) eventCallback(trackNum, TRACK_STARTED);
@@ -226,41 +237,6 @@ namespace async {
             return trackNum >= 0 && trackNum < MAX_TRACKS && initialized;
         }
         
-        bool skipWavHeader(Stream* stream) {
-            // Check RIFF header
-            char header[12];
-            if (stream->read(header, 12) != 12) return false;
-            if (strncmp(header, "RIFF", 4) != 0 || strncmp(header+8, "WAVE", 4) != 0) return false;
-            
-            // Find "fmt " chunk
-            while (true) {
-                char chunkHeader[8];
-                if (stream->read(chunkHeader, 8) != 8) return false;
-                
-                uint32_t chunkSize = *reinterpret_cast<uint32_t*>(chunkHeader + 4);
-                if (strncmp(chunkHeader, "fmt ", 4) == 0) {
-                    // Skip format chunk (we assume it's 16-bit mono)
-                    stream->seek(stream->position() + chunkSize);
-                    break;
-                } else {
-                    stream->seek(stream->position() + chunkSize);
-                }
-            }
-            
-            // Find "data" chunk
-            while (true) {
-                char chunkHeader[8];
-                if (stream->read(chunkHeader, 8) != 8) return false;
-                
-                if (strncmp(chunkHeader, "data", 4) == 0) {
-                    return true;
-                } else {
-                    uint32_t chunkSize = *reinterpret_cast<uint32_t*>(chunkHeader + 4);
-                    stream->seek(stream->position() + chunkSize);
-                }
-            }
-        }
-        
         bool mixTrack(int trackNum) {
             AudioTrack& track = tracks[trackNum];
             
@@ -268,30 +244,28 @@ namespace async {
             if (track.bufferPos >= mixBufferSize) {
                 size_t samplesToRead = mixBufferSize;
                 
-                // For streams with known size
-                if (track.dataSize > 0) {
-                    size_t bytesRemaining = track.dataSize - track.position;
-                    samplesToRead = min(mixBufferSize, bytesRemaining / sizeof(int16_t));
-                    
-                    if (samplesToRead == 0) {
+                size_t bytesRead = track.stream->read(reinterpret_cast<char*>(track.buffer), samplesToRead * sizeof(int16_t));
+                track.bufferPos = 0;
+                
+                if (bytesRead == 0) {
+                    if(track.loop) {
+                        track.stream->seek(44);
+                         track.fadeVolume = 0;
+                    }
+                    else {
                         stop(trackNum);
                         return false;
                     }
-                }
-                
-                size_t bytesRead = track.stream->read(reinterpret_cast<char*>(track.buffer), samplesToRead * sizeof(int16_t));
-                track.bufferPos = 0;
-                track.position += bytesRead;
-                
-                if (bytesRead == 0) {
-                    stop(trackNum);
-                    return false;
                 }
             }
             
             // Mix samples with volume
             for (size_t i = 0; i < mixBufferSize && track.bufferPos < mixBufferSize; i++) {
-                mixBuffer[i] += track.buffer[track.bufferPos++] * track.volume;
+                mixBuffer[i] += track.buffer[track.bufferPos++] * track.fadeVolume;
+            }
+
+            if(track.fadeVolume < track.volume) {
+                track.fadeVolume += 0.1f;
             }
             
             return true;
